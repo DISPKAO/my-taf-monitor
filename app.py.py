@@ -1,92 +1,186 @@
-import streamlit as st
 import requests
 import re
+import math
+from datetime import datetime
 
-st.set_page_config(page_title="專業 TAF 深度監控", layout="wide")
-st.title("✈️ 航空氣象 TAF 完整歷史監控與比對")
+# -----------------------
+# CONFIG
+# -----------------------
+RUNWAYS = {
+    "RCTP": [{"name":"05L","hdg":50},{"name":"23R","hdg":230}],
+    "RCSS": [{"name":"10","hdg":100},{"name":"28","hdg":280}]
+}
 
-# --- 側邊欄 ---
-input_icao = st.sidebar.text_input("輸入機場代碼", value="WSSS, RCTP, RCSS")
-icao_list = [code.strip().upper() for code in re.split(r'[ ,]+', input_icao) if code.strip()]
+# -----------------------
+# FETCH DATA
+# -----------------------
+def fetch_taf(station):
+    url = f"https://aviationweather.gov/api/data/taf?ids={station}&format=raw"
+    return requests.get(url).text.strip()
 
-def format_and_highlight(taf):
-    """處理換行排版與紅字標註"""
-    # 1. 強制換行：在 TEMPO, BECMG, FM, PROB 前面加上換行
-    formatted = re.sub(r"\s(TEMPO|BECMG|FM|PROB\d{2})\s", r"<br>&nbsp;&nbsp;<b>\1</b> ", taf)
-    
-    # 2. 標註危險天氣 (紅字加粗)
-    hazards = r"(\+RA|\+SHRA|TSRA|TSSH|TS|VCTS|VCSH|SN|FG|FZFG|BLSN|SQ|SS|DS)"
-    formatted = re.sub(f"({hazards})", r'<span style="color:red; font-weight:bold;">\1</span>', formatted)
-    
-    # 3. 標註低能見度 (< 0800m)
-    def vis_replacer(match):
-        v = int(match.group(1))
-        if v < 800:
-            return f' <span style="color:red; font-weight:bold;">{match.group(1)}</span> '
-        return f" {match.group(1)} "
-    formatted = re.sub(r"\s(\d{4})\s", vis_replacer, formatted)
-    
-    # 4. 標註低雲幕 (BKN/OVC 001-005)
-    formatted = re.sub(r"((?:BKN|OVC)00[1-5])", r'<span style="color:red; font-weight:bold;">\1</span>', formatted)
-    
-    return formatted
+def fetch_metar(station):
+    url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=raw"
+    return requests.get(url).text.strip()
 
-def get_worst(taf_block):
-    """分析報文中最差數值"""
-    vis_vals = [int(v) for v in re.findall(r"\b(\d{4})\b", taf_block)]
-    min_v = min(vis_vals) if vis_vals else 9999
-    clouds = [int(c[1]) for c in re.findall(r"(BKN|OVC)(\d{3})", taf_block)]
-    min_c = min(clouds) if clouds else 999
-    has_ts = any(x in taf_block for x in ["TS", "+RA", "FG", "SN"])
-    return min_v, min_c, has_ts
+def fetch_notam(station):
+    # prototype API（可能不完整）
+    url = f"https://aviationweather.gov/api/data/notam?ids={station}"
+    return requests.get(url).text
 
-def fetch_history_data(icao):
-    """增加 &prior=4 參數以抓取歷史版本"""
-    # 關鍵修正：加入 &prior=4
-    url = f"https://aviationweather.gov/api/data/taf?ids={icao}&format=json&prior=4"
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            # 確保按時間排序 (最新在前面)
-            return sorted(data, key=lambda x: x.get('issueTime', ''), reverse=True)
-    except: pass
-    return []
+# -----------------------
+# PARSER
+# -----------------------
+def extract_worst(taf):
 
-# --- 主畫面 ---
-if icao_list:
-    for icao in icao_list:
-        with st.expander(f"📊 機場：{icao}", expanded=True):
-            data_list = fetch_history_data(icao)
-            
-            if len(data_list) >= 1:
-                # 版本比對警告
-                if len(data_list) >= 2:
-                    v1_raw = data_list[0].get('rawTAF', '')
-                    v2_raw = data_list[1].get('rawTAF', '')
-                    v1_v, v1_c, v1_t = get_worst(v1_raw)
-                    v2_v, v2_c, v2_t = get_worst(v2_raw)
-                    
-                    diff = []
-                    if v1_v < v2_v: diff.append(f"👁️ 能見度下降({v1_v}m)")
-                    if v1_c < v2_c: diff.append(f"☁️ 雲幕下降({v1_c*100}ft)")
-                    if v1_t and not v2_t: diff.append("⚠️ 新增危險天氣")
-                    
-                    if diff: st.error(f"🚨 偵測到報文惡化：{' | '.join(diff)}")
-                    else: st.success("✅ 與前版相比天氣趨勢平穩")
+    vis = [int(v) for v in re.findall(r"\b\d{4}\b", taf)]
+    ceil = [int(c[3:]) for c in re.findall(r"(BKN\d{3}|OVC\d{3})", taf)]
+    wx = re.findall(r"(TS|RA|SN|FG)", taf)
 
-                # 顯示清單
-                for i, item in enumerate(data_list):
-                    raw = item.get('rawTAF', '')
-                    time = item.get('issueTime', 'N/A')
-                    label = f"【最新版本】 (發布: {time})" if i == 0 else f"【歷史版本 {i}】 (發布: {time})"
-                    
-                    st.markdown(f"**{label}**")
-                    st.markdown(
-                        f'''<div style="background-color: #f9f9f9; padding: 15px; border-left: 5px solid {"#ff4b4b" if i==0 else "#ccc"}; 
-                        border-radius: 5px; font-family: 'Courier New', monospace; font-size: 15px; line-height: 1.7;">
-                        {format_and_highlight(raw)}
-                        </div>''', unsafe_allow_html=True
-                    )
-            else:
-                st.info(f"查無 {icao} 資料。")
+    return {
+        "vis": min(vis) if vis else 9999,
+        "ceiling": min(ceil) if ceil else 999,
+        "wx": set(wx)
+    }
+
+def parse_metar_wind(metar):
+
+    m = re.search(r"(\d{3}|VRB)(\d{2})KT", metar)
+    if not m:
+        return None, None
+
+    wd = 0 if m.group(1)=="VRB" else int(m.group(1))
+    ws = int(m.group(2))
+
+    return wd, ws
+
+# -----------------------
+# RUNWAY / WIND
+# -----------------------
+def wind_component(wd, ws, hdg):
+
+    angle = abs(wd - hdg)
+    angle = min(angle, 360-angle)
+
+    rad = math.radians(angle)
+
+    cross = ws * math.sin(rad)
+    head = ws * math.cos(rad)
+
+    return round(cross,1), round(head,1)
+
+# -----------------------
+# NOTAM
+# -----------------------
+def parse_notam(text):
+
+    notams = text.split("\n\n")
+    result = []
+
+    for n in notams:
+
+        if "RWY" in n and "CLSD" in n:
+            t = "RWY_CLOSED"
+        elif "ILS" in n and "U/S" in n:
+            t = "ILS_U/S"
+        else:
+            continue
+
+        result.append({
+            "type": t,
+            "raw": n
+        })
+
+    return result
+
+# -----------------------
+# DECISION
+# -----------------------
+def alternate_check(vis, ceiling):
+
+    return vis >= 2000 and ceiling >= 800
+
+def fuel_model(trend, alt_ok):
+
+    score = 0
+    if trend["vis_down"]: score+=1
+    if trend["ceiling_down"]: score+=1
+    if trend["new_ts"]: score+=2
+    if not alt_ok: score+=3
+
+    if score>=4: return "HIGH"
+    elif score>=2: return "MEDIUM"
+    else: return "LOW"
+
+# -----------------------
+# MAIN
+# -----------------------
+def analyze_station(station, prev_taf=None):
+
+    print(f"\n===== {station} =====")
+
+    taf = fetch_taf(station)
+    metar = fetch_metar(station)
+    notam_raw = fetch_notam(station)
+
+    print("TAF:", taf)
+    print("METAR:", metar)
+
+    # worst
+    worst = extract_worst(taf)
+
+    # trend
+    trend = {"vis_down":False,"ceiling_down":False,"new_ts":False}
+
+    if prev_taf:
+        prev = extract_worst(prev_taf)
+        trend = {
+            "vis_down": worst["vis"] < prev["vis"],
+            "ceiling_down": worst["ceiling"] < prev["ceiling"],
+            "new_ts": ("TS" in worst["wx"] and "TS" not in prev["wx"])
+        }
+
+    print("Trend:", trend)
+
+    # wind
+    wd, ws = parse_metar_wind(metar)
+
+    if wd is not None:
+        print("\nRunway Wind:")
+        for r in RUNWAYS.get(station, []):
+            cw, hw = wind_component(wd, ws, r["hdg"])
+            print(f"{r['name']} | XW:{cw} HW:{hw}")
+
+    # alternate
+    alt_ok = alternate_check(worst["vis"], worst["ceiling"])
+    print("\nAlternate:", "OK" if alt_ok else "NOT OK")
+
+    # NOTAM
+    notams = parse_notam(notam_raw)
+
+    if notams:
+        print("\nNOTAM Impact:")
+        for n in notams:
+            print(n["type"], ":", n["raw"][:80])
+    else:
+        print("\nNOTAM: None critical")
+
+    # fuel
+    fuel = fuel_model(trend, alt_ok)
+    print("\nFuel Risk:", fuel)
+
+    return taf
+
+# -----------------------
+# RUN
+# -----------------------
+if __name__ == "__main__":
+
+    stations = input("Enter ICAO (comma): ").split(",")
+
+    history = {}
+
+    for s in stations:
+        s = s.strip().upper()
+        prev = history.get(s)
+        taf = analyze_station(s, prev)
+        history[s] = taf
